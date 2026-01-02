@@ -1,0 +1,1416 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  HYPERMORPHIC HOLOGRAPHIC GEARBOX NEURAL NETWORK - COMPLETE EDITION          ║
+║  Full Training Pipeline with OFFLINE Dictionary + Thesaurus (WordNet) + SQuAD║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  UPGRADES IN THIS EDITION                                                   ║
+║  • Replaced web Dictionary/Thesaurus APIs with OFFLINE WordNet + wordfreq    ║
+║    - no rate limits, reproducible, scalable to tens/hundreds of thousands    ║
+║  • Robust QA span mapping using sequence_ids() (prevents misaligned spans)   ║
+║  • Controlled dataset mixing (e.g., 70% SQuAD / 30% Vocab) to protect EM      ║
+║  • Optional on-disk caching of WordNet vocab build (fast restarts)           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+GOOGLE COLAB INSTRUCTIONS:
+1. Copy this entire script into a Colab cell
+2. Run - it installs deps, builds offline vocab cache, trains w/ early stopping
+"""
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 1: INSTALLATIONS
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("█" * 80)
+print("█  HYPERMORPHIC HOLOGRAPHIC GEARBOX - COMPLETE EDITION (OFFLINE VOCAB)" + " " * 4 + "█")
+print("█" * 80)
+
+print("\n" + "=" * 80)
+print("  INSTALLING DEPENDENCIES")
+print("=" * 80)
+
+import subprocess
+import sys
+
+def install(package: str):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", package])
+
+packages = [
+    "torch", "torchvision", "torchaudio",
+    "transformers", "datasets", "tokenizers", "sentencepiece",
+    "pandas", "matplotlib", "tqdm",
+    "numpy", "scipy",
+    # OFFLINE DICT/THESAURUS
+    "nltk", "wordfreq",
+]
+
+for pkg in packages:
+    try:
+        install(pkg)
+    except Exception as e:
+        print(f"  Note: {pkg} - {e}")
+
+print("\n✓ Dependencies installed!")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 2: IMPORTS AND CONFIGURATION
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 80)
+print("  IMPORTING LIBRARIES")
+print("=" * 80)
+
+import os
+import re
+import json
+import time
+import math
+import random
+import warnings
+import itertools
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional, Any
+
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
+
+from datasets import load_dataset
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+
+# OFFLINE DICT/THESAURUS
+import nltk
+from nltk.corpus import wordnet as wn
+from wordfreq import top_n_list
+
+warnings.filterwarnings("ignore")
+
+# Reproducibility
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+    torch.backends.cudnn.deterministic = True
+
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\n✓ Device: {DEVICE}")
+if torch.cuda.is_available():
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+
+# Prime frequencies for holographic operations
+PRIME_FREQUENCIES = {
+    "tiny": [3, 5, 7],
+    "small": [11, 13, 17, 19, 23],
+    "medium": [29, 31, 37, 41, 43, 47],
+    "large": [53, 59, 61, 67, 71, 73, 79],
+    "default": [31, 37, 41, 43, 47],
+    "holoraid": [53, 59, 61, 67, 71],
+}
+
+print("✓ All imports successful!")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 3: COMPLETE MODEL ARCHITECTURE
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 80)
+print("  BUILDING HYPERMORPHIC HOLOGRAPHIC GEARBOX ARCHITECTURE")
+print("=" * 80)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HOLORAID: CRT-Based Fault-Tolerant Encoding (FIXED)
+# ───────────────────────────────────────────────────────────────────────────────
+
+class HoloRAID(nn.Module):
+    def __init__(self, n_shards: int = 5, k_threshold: int = 3,
+                 primes: List[int] = None, scale: float = 100.0):
+        super().__init__()
+        self.n = n_shards
+        self.k = k_threshold
+        self.scale = scale
+        if primes is None:
+            self.primes = PRIME_FREQUENCIES["holoraid"][:n_shards]
+        else:
+            self.primes = primes[:n_shards]
+        self._verify_coprime()
+        self.register_buffer("prime_tensor", torch.tensor(self.primes, dtype=torch.float32))
+
+    def _verify_coprime(self):
+        from math import gcd
+        for i, p1 in enumerate(self.primes):
+            for p2 in self.primes[i + 1:]:
+                assert gcd(p1, p2) == 1, f"Primes {p1}, {p2} not coprime!"
+
+    def _mod_inverse(self, a: int, m: int) -> int:
+        def extended_gcd(a: int, b: int) -> Tuple[int, int, int]:
+            if b == 0:
+                return a, 1, 0
+            g, x, y = extended_gcd(b, a % b)
+            return g, y, x - (a // b) * y
+
+        g, x, _ = extended_gcd(a % m, m)
+        if g != 1:
+            raise ValueError(f"Modular inverse doesn't exist for {a} mod {m}")
+        return x % m
+
+    def _compute_crt_coefficients(self, indices: List[int]) -> Tuple[int, List[int], List[int]]:
+        selected_primes = [self.primes[i] for i in indices]
+        M = 1
+        for p in selected_primes:
+            M *= p
+        M_i = [M // p for p in selected_primes]
+        y_i = [self._mod_inverse(M_i[j], selected_primes[j]) for j in range(len(indices))]
+        return M, M_i, y_i
+
+    def encode(self, x: torch.Tensor) -> List[torch.Tensor]:
+        x_shifted = x - x.min() + 1
+        x_scaled = (x_shifted * self.scale).long()
+        shards = []
+        for p in self.primes:
+            residue = (x_scaled % p).float() / p
+            shards.append(residue)
+        self._last_min = x.min().item()
+        return shards
+
+    def decode(self, shards: List[torch.Tensor], indices: List[int] = None) -> torch.Tensor:
+        if indices is None:
+            indices = list(range(self.k))
+        indices = sorted(indices[:self.k])
+        M, M_i, y_i = self._compute_crt_coefficients(indices)
+
+        result = torch.zeros_like(shards[0])
+        for j, idx in enumerate(indices):
+            shard = shards[idx]
+            p = self.primes[idx]
+            r = (shard * p).round()
+            result = result + r * M_i[j] * y_i[j]
+
+        result = torch.fmod(result, float(M))
+        result = result / self.scale
+        if hasattr(self, "_last_min"):
+            result = result + self._last_min - 1
+        return result
+
+    def forward(self, x: torch.Tensor, fault_probability: float = 0.2) -> torch.Tensor:
+        shards = self.encode(x)
+        if self.training and random.random() < fault_probability:
+            indices = sorted(random.sample(range(self.n), self.k))
+        else:
+            indices = list(range(self.k))
+        return self.decode(shards, indices)
+
+    def get_redundancy_factor(self) -> float:
+        return self.n / self.k
+
+    def get_fault_tolerance(self) -> int:
+        return self.n - self.k
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SAFEGEAR
+# ───────────────────────────────────────────────────────────────────────────────
+
+class SafeGear(nn.Module):
+    def __init__(self, dim: int, n_gears: int = 4):
+        super().__init__()
+        self.dim = dim
+        self.n_gears = n_gears
+        self.gear_a = nn.Parameter(torch.ones(n_gears) * 0.5)
+        self.gear_b = nn.Parameter(torch.ones(n_gears) * 7.0)
+        self.mix = nn.Linear(dim, dim)
+        self.norm = nn.LayerNorm(dim)
+
+    def gear_transform(self, x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        a_pos = F.softplus(a) + 0.1
+        b_pos = F.softplus(b) + 2.0
+        mod_component = torch.sin(2 * math.pi * x / b_pos) * a_pos
+        div_component = x / b_pos
+        return mod_component + div_component
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = x
+        for i in range(self.n_gears):
+            out = self.gear_transform(out, self.gear_a[i], self.gear_b[i])
+        out = self.mix(out)
+        return self.norm(out + x)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HOLOMIX
+# ───────────────────────────────────────────────────────────────────────────────
+
+class HoloMix(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int = None,
+                 frequencies: List[int] = None, alpha: float = 0.3,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim or dim * 4
+        self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
+        self.n_freq = len(self.frequencies)
+        self.alpha = alpha
+
+        self.W1 = nn.Linear(dim, self.hidden_dim)
+        self.W2 = nn.Linear(self.hidden_dim, dim)
+
+        self.amplitudes = nn.Parameter(torch.randn(self.n_freq, self.hidden_dim) * 0.1)
+        self.phases = nn.Parameter(torch.rand(self.n_freq, self.hidden_dim) * 2 * math.pi)
+
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+        self.register_buffer("freq_tensor", torch.tensor(self.frequencies, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.W1(x)
+        interference = torch.zeros_like(h)
+        for i, freq in enumerate(self.frequencies):
+            phase = 2 * math.pi * h / freq + self.phases[i]
+            interference = interference + self.amplitudes[i] * torch.sin(phase)
+        h = h + self.alpha * interference
+        h = F.gelu(h)
+        h = self.dropout(h)
+        out = self.W2(h)
+        return self.norm(out)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HOLOGRAPHIC ATTENTION
+# ───────────────────────────────────────────────────────────────────────────────
+
+class HolographicAttention(nn.Module):
+    def __init__(self, dim: int, n_heads: int = 4, dropout: float = 0.1,
+                 frequencies: List[int] = None):
+        super().__init__()
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
+        self.n_freq = len(self.frequencies)
+        assert dim % n_heads == 0, "dim must be divisible by n_heads"
+
+        self.W_q = nn.Linear(dim, dim)
+        self.W_k = nn.Linear(dim, dim)
+        self.W_v = nn.Linear(dim, dim)
+        self.W_o = nn.Linear(dim, dim)
+
+        self.alpha = nn.Parameter(torch.randn(n_heads, self.n_freq) * 0.1)
+        self.phi = nn.Parameter(torch.rand(n_heads, self.n_freq) * 2 * math.pi)
+        self.temperature = nn.Parameter(torch.ones(1))
+
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+        self.last_attention_weights = None
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        B, L, D = x.shape
+
+        Q = self.W_q(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        K = self.W_k(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+        V = self.W_v(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
+
+        similarity = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        temp = self.temperature.abs() + 0.1
+        similarity = similarity / temp
+
+        scores = torch.zeros_like(similarity)
+        for f_idx, freq in enumerate(self.frequencies):
+            phase = 2 * math.pi * similarity / freq
+            phase = phase + self.phi[:, f_idx].view(1, self.n_heads, 1, 1)
+            scores = scores + self.alpha[:, f_idx].view(1, self.n_heads, 1, 1) * torch.sin(phase)
+
+        if mask is not None:
+            if mask.dim() == 2:
+                mask = mask.unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        weights = torch.sigmoid(scores)
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-10)
+
+        self.last_attention_weights = weights.detach()
+        weights = self.dropout(weights)
+
+        out = torch.matmul(weights, V)
+        out = out.transpose(1, 2).contiguous().view(B, L, D)
+        out = self.W_o(out)
+        return self.norm(out)
+
+    def get_frequency_response(self) -> Dict[int, torch.Tensor]:
+        if self.last_attention_weights is None:
+            return {}
+        return {freq: self.alpha[:, i].detach() for i, freq in enumerate(self.frequencies)}
+
+
+class HolographicTransformerBlock(nn.Module):
+    def __init__(self, dim: int, n_heads: int = 4, dropout: float = 0.1,
+                 frequencies: List[int] = None, ffn_mult: int = 4):
+        super().__init__()
+        self.attention = HolographicAttention(dim, n_heads, dropout, frequencies)
+        self.ffn = HoloMix(dim, dim * ffn_mult, frequencies, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        h = self.norm1(x)
+        h = self.attention(h, mask)
+        x = x + self.dropout(h)
+        h = self.norm2(x)
+        h = self.ffn(h)
+        x = x + self.dropout(h)
+        return x
+
+
+class HolographicGearboxModel(nn.Module):
+    def __init__(self, vocab_size: int, dim: int = 256, n_layers: int = 4,
+                 n_heads: int = 4, max_seq_len: int = 512, dropout: float = 0.1,
+                 n_classes: int = 2, frequencies: List[int] = None,
+                 use_holoraid: bool = True, holoraid_prob: float = 0.1):
+        super().__init__()
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
+        self.use_holoraid = use_holoraid
+        self.holoraid_prob = holoraid_prob
+
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        self.safegear = SafeGear(dim, n_gears=3)
+
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim))
+        self._init_holographic_positions()
+
+        self.holoraid = HoloRAID(n_shards=5, k_threshold=3, scale=100.0)
+
+        self.layers = nn.ModuleList([
+            HolographicTransformerBlock(dim, n_heads, dropout, self.frequencies)
+            for _ in range(n_layers)
+        ])
+
+        self.norm = nn.LayerNorm(dim)
+        self.dropout = nn.Dropout(dropout)
+
+        self.qa_head = nn.Linear(dim, 2)
+        self.cls_head = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, n_classes)
+        )
+        self.lm_head = nn.Linear(dim, vocab_size)
+
+        self._init_weights()
+
+    def _init_holographic_positions(self):
+        positions = torch.arange(self.max_seq_len).float()
+        pe = torch.zeros(self.max_seq_len, self.dim)
+
+        for i, freq in enumerate(self.frequencies):
+            if i * 2 < self.dim:
+                pe[:, i * 2] = torch.sin(2 * math.pi * positions / freq)
+            if i * 2 + 1 < self.dim:
+                pe[:, i * 2 + 1] = torch.cos(2 * math.pi * positions / freq)
+
+        for i in range(len(self.frequencies) * 2, self.dim, 2):
+            div_term = 10000 ** (i / self.dim)
+            pe[:, i] = torch.sin(positions / div_term)
+            if i + 1 < self.dim:
+                pe[:, i + 1] = torch.cos(positions / div_term)
+
+        self.pos_embed.data = pe.unsqueeze(0)
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, std=0.02)
+            elif isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None, task: str = "qa") -> Dict[str, torch.Tensor]:
+        B, L = input_ids.shape
+        x = self.token_embed(input_ids)
+        x = self.safegear(x)
+        x = x + self.pos_embed[:, :L, :]
+
+        if self.use_holoraid and self.training:
+            if random.random() < self.holoraid_prob:
+                x = self.holoraid(x)
+
+        x = self.dropout(x)
+
+        mask = attention_mask.unsqueeze(1).unsqueeze(2) if attention_mask is not None else None
+
+        for layer in self.layers:
+            x = layer(x, mask)
+
+        x = self.norm(x)
+        outputs = {"hidden_states": x}
+
+        if task == "qa":
+            logits = self.qa_head(x)
+            outputs["start_logits"] = logits[:, :, 0]
+            outputs["end_logits"] = logits[:, :, 1]
+        elif task == "classify":
+            cls_hidden = x[:, 0, :]
+            outputs["logits"] = self.cls_head(cls_hidden)
+        elif task == "lm":
+            outputs["logits"] = self.lm_head(x)
+
+        return outputs
+
+    def get_num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+    def get_attention_weights(self, layer_idx: int = -1) -> Optional[torch.Tensor]:
+        if 0 <= layer_idx < len(self.layers) or layer_idx == -1:
+            layer = self.layers[layer_idx]
+            return layer.attention.last_attention_weights
+        return None
+
+
+print("✓ Model architecture defined!")
+print(f"  Components: HoloRAID, SafeGear, HoloMix, HolographicAttention")
+print(f"  Frequencies: {PRIME_FREQUENCIES['default']}")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 4: DATA LOADING (OFFLINE WordNet + wordfreq, and SQuAD)
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 80)
+print("  LOADING DATA SOURCES (OFFLINE VOCAB + SQuAD)")
+print("=" * 80)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# OFFLINE "ENTIRE DICTIONARY + THESAURUS" BUILDER
+# ───────────────────────────────────────────────────────────────────────────────
+
+def ensure_wordnet():
+    try:
+        wn.synsets("test")
+    except LookupError:
+        nltk.download("wordnet")
+        nltk.download("omw-1.4")
+
+_word_re = re.compile(r"^[a-z][a-z\-']*$")
+
+def wordnet_entry(word: str, max_syn=12, max_ant=8, max_rel=12) -> Optional[Dict[str, Any]]:
+    synsets = wn.synsets(word)
+    if not synsets:
+        return None
+
+    defs: List[str] = []
+    for s in synsets[:3]:
+        d = s.definition()
+        if d and d not in defs:
+            defs.append(d)
+
+    synonyms: List[str] = []
+    antonyms: List[str] = []
+    related: List[str] = []
+
+    for s in synsets:
+        for lemma in s.lemmas():
+            w = lemma.name().replace("_", " ").lower()
+            if w != word and w not in synonyms:
+                synonyms.append(w)
+            for ant in lemma.antonyms():
+                a = ant.name().replace("_", " ").lower()
+                if a not in antonyms:
+                    antonyms.append(a)
+
+        # related: hypernyms/hyponyms (small sample)
+        for h in s.hypernyms()[:3]:
+            for lemma in h.lemmas()[:3]:
+                rw = lemma.name().replace("_", " ").lower()
+                if rw != word and rw not in related:
+                    related.append(rw)
+        for h in s.hyponyms()[:3]:
+            for lemma in h.lemmas()[:3]:
+                rw = lemma.name().replace("_", " ").lower()
+                if rw != word and rw not in related:
+                    related.append(rw)
+
+    entry: Dict[str, Any] = {"word": word}
+    if defs:
+        entry["definitions"] = defs
+    if synonyms:
+        entry["synonyms"] = synonyms[:max_syn]
+    if antonyms:
+        entry["antonyms"] = antonyms[:max_ant]
+    if related:
+        entry["related"] = related[:max_rel]
+
+    if len(entry) == 1:
+        return None
+    return entry
+
+def load_vocab_cache_jsonl(path: str, limit: int) -> List[Dict[str, Any]]:
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except:
+                continue
+            if len(out) >= limit:
+                break
+    return out
+
+def save_vocab_cache_jsonl(path: str, entries: List[Dict[str, Any]]):
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+
+def build_massive_vocab_dataset(
+    target_size: int = 50000,
+    min_word_len: int = 3,
+    top_k_wordfreq: int = 200000,
+    cache_path: str = "wordnet_vocab_cache.jsonl",
+) -> List[Dict[str, Any]]:
+    """
+    Build a large offline dictionary/thesaurus dataset:
+      - candidates from wordfreq top list
+      - enrich via WordNet (defs/syn/ant/rel)
+      - cached to disk for reproducibility / fast reruns
+    """
+    ensure_wordnet()
+
+    cached = load_vocab_cache_jsonl(cache_path, target_size)
+    if len(cached) >= target_size:
+        print(f"  ✓ Loaded vocab cache: {len(cached)} entries from {cache_path}")
+        return cached[:target_size]
+
+    if cached:
+        print(f"  ✓ Partial cache found: {len(cached)} entries. Continuing build...")
+
+    candidates = top_n_list("en", top_k_wordfreq)
+
+    dataset = list(cached)
+    seen = {d["word"] for d in dataset if "word" in d}
+
+    for w in tqdm(candidates, desc="Building WordNet vocab"):
+        w = w.strip().lower()
+        if w in seen:
+            continue
+        if len(w) < min_word_len:
+            continue
+        if not _word_re.match(w):
+            continue
+
+        seen.add(w)
+        entry = wordnet_entry(w)
+        if entry:
+            dataset.append(entry)
+
+        if len(dataset) >= target_size:
+            break
+
+    save_vocab_cache_jsonl(cache_path, dataset)
+    print(f"  ✓ Saved vocab cache: {len(dataset)} entries → {cache_path}")
+    return dataset
+
+# ───────────────────────────────────────────────────────────────────────────────
+# QA DATASETS (OFFLINE VOCAB → QA, and SQuAD)
+# ───────────────────────────────────────────────────────────────────────────────
+
+def find_answer_token_span(enc, answer_start: int, answer_text: str) -> Tuple[int, int]:
+    """
+    Robust span mapping for (question, context) pairs:
+    - only consider tokens where sequence_id == 1 (context side)
+    - fall back to CLS if not found (common when truncation drops answer)
+    """
+    answer_end = answer_start + len(answer_text)
+    offsets = enc["offset_mapping"][0].tolist()
+    seq_ids = enc.sequence_ids(0)
+
+    cls_index = 0
+    start_pos = cls_index
+    end_pos = cls_index
+
+    # locate
+    for i, (s, e) in enumerate(offsets):
+        if seq_ids[i] != 1:
+            continue
+        if s == e == 0:
+            continue
+        if s <= answer_start < e:
+            start_pos = i
+        if s < answer_end <= e:
+            end_pos = i
+            break
+
+    if end_pos < start_pos:
+        end_pos = start_pos
+    return start_pos, end_pos
+
+class VocabularyQADataset(Dataset):
+    """
+    OFFLINE vocab QA from WordNet entries.
+    Each entry may contain:
+      definitions: [..]
+      synonyms: [..]
+      antonyms: [..]
+      related: [..]
+    """
+    def __init__(self, vocab_data: List[Dict[str, Any]], tokenizer, max_length: int = 384,
+                 max_syn_show: int = 5, max_ant_show: int = 3, max_rel_show: int = 5):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.features: List[Dict[str, torch.Tensor]] = []
+        self.samples: List[Dict[str, Any]] = []
+
+        for entry in vocab_data:
+            word = entry.get("word", "")
+            if not word:
+                continue
+
+            # Definition QA (use first definition)
+            defs = entry.get("definitions", [])
+            if defs:
+                definition = defs[0]
+                ctx = f"The word {word} is defined as: {definition}"
+                q = f"What is the definition of {word}?"
+                self.samples.append({
+                    "question": q,
+                    "context": ctx,
+                    "answer": definition,
+                    "answer_start": len(f"The word {word} is defined as: ")
+                })
+
+            # Synonyms QA
+            syns = entry.get("synonyms", [])
+            if syns:
+                ans = ", ".join(syns[:max_syn_show])
+                ctx = f"Synonyms of {word} include: {ans}. These words have similar meanings."
+                q = f"What are synonyms of {word}?"
+                self.samples.append({
+                    "question": q,
+                    "context": ctx,
+                    "answer": ans,
+                    "answer_start": len(f"Synonyms of {word} include: ")
+                })
+
+            # Antonyms QA
+            ants = entry.get("antonyms", [])
+            if ants:
+                ans = ", ".join(ants[:max_ant_show])
+                ctx = f"The opposite of {word} is: {ans}. These are antonyms."
+                q = f"What is the opposite of {word}?"
+                self.samples.append({
+                    "question": q,
+                    "context": ctx,
+                    "answer": ans,
+                    "answer_start": len(f"The opposite of {word} is: ")
+                })
+
+            # Related words QA
+            rel = entry.get("related", [])
+            if rel:
+                ans = ", ".join(rel[:max_rel_show])
+                ctx = f"Words related to {word} include: {ans}. They share semantic connections."
+                q = f"What words are related to {word}?"
+                self.samples.append({
+                    "question": q,
+                    "context": ctx,
+                    "answer": ans,
+                    "answer_start": len(f"Words related to {word} include: ")
+                })
+
+        for sample in tqdm(self.samples, desc="Tokenizing Vocab QA"):
+            enc = self.tokenizer(
+                sample["question"],
+                sample["context"],
+                max_length=self.max_length,
+                truncation="only_second",
+                padding="max_length",
+                return_offsets_mapping=True,
+                return_tensors="pt"
+            )
+            start_pos, end_pos = find_answer_token_span(enc, sample["answer_start"], sample["answer"])
+            self.features.append({
+                "input_ids": enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "start_positions": torch.tensor(start_pos, dtype=torch.long),
+                "end_positions": torch.tensor(end_pos, dtype=torch.long),
+            })
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        f = self.features[idx]
+        return {
+            "input_ids": f["input_ids"],
+            "attention_mask": f["attention_mask"],
+            "start_positions": f["start_positions"].item(),
+            "end_positions": f["end_positions"].item(),
+        }
+
+class SQuADDataset(Dataset):
+    def __init__(self, tokenizer, split: str = "train", max_length: int = 384, max_samples: int = None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        print(f"  Loading SQuAD {split}...")
+        dataset = load_dataset("squad", split=split)
+        if max_samples:
+            dataset = dataset.select(range(min(max_samples, len(dataset))))
+
+        self.features: List[Dict[str, Any]] = []
+        self.examples: List[Dict[str, Any]] = []
+
+        print(f"  Processing {len(dataset)} examples...")
+        for example in tqdm(dataset, desc=f"Tokenizing SQuAD ({split})"):
+            enc = self.tokenizer(
+                example["question"],
+                example["context"],
+                max_length=self.max_length,
+                truncation="only_second",
+                padding="max_length",
+                return_offsets_mapping=True,
+                return_tensors="pt"
+            )
+
+            cls_index = 0
+            start_pos, end_pos = cls_index, cls_index
+            answers = example["answers"]
+            if answers.get("answer_start") and len(answers["answer_start"]) > 0:
+                answer_start = answers["answer_start"][0]
+                answer_text = answers["text"][0]
+                start_pos, end_pos = find_answer_token_span(enc, answer_start, answer_text)
+
+            self.features.append({
+                "input_ids": enc["input_ids"].squeeze(0),
+                "attention_mask": enc["attention_mask"].squeeze(0),
+                "start_positions": torch.tensor(start_pos, dtype=torch.long),
+                "end_positions": torch.tensor(end_pos, dtype=torch.long),
+            })
+
+            self.examples.append({
+                "question": example["question"],
+                "context": example["context"],
+                "answers": answers,
+            })
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        f = self.features[idx]
+        return {
+            "input_ids": f["input_ids"],
+            "attention_mask": f["attention_mask"],
+            "start_positions": f["start_positions"].item(),
+            "end_positions": f["end_positions"].item(),
+        }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# LOAD ALL DATA
+# ───────────────────────────────────────────────────────────────────────────────
+
+print("\n  Initializing tokenizer...")
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# Build OFFLINE dictionary+thesaurus dataset
+VOCAB_CACHE_PATH = "wordnet_vocab_cache.jsonl"
+VOCAB_TARGET_ENTRIES = 50000          # crank to 100k+ if you want
+VOCAB_WORD_FREQ_CANDIDATES = 200000   # candidate pool size
+
+print("\n  Building offline dictionary + thesaurus (WordNet)…")
+vocab_data = build_massive_vocab_dataset(
+    target_size=VOCAB_TARGET_ENTRIES,
+    top_k_wordfreq=VOCAB_WORD_FREQ_CANDIDATES,
+    cache_path=VOCAB_CACHE_PATH
+)
+print(f"  ✓ Loaded {len(vocab_data)} WordNet vocab entries")
+
+vocab_dataset = VocabularyQADataset(vocab_data, tokenizer, max_length=384)
+print(f"  ✓ Created {len(vocab_dataset)} vocabulary QA samples")
+
+# Load SQuAD datasets
+MAX_TRAIN_SAMPLES = 10000
+MAX_VAL_SAMPLES = 2000
+
+squad_train = SQuADDataset(tokenizer, "train", max_length=384, max_samples=MAX_TRAIN_SAMPLES)
+squad_val = SQuADDataset(tokenizer, "validation", max_length=384, max_samples=MAX_VAL_SAMPLES)
+
+print(f"  ✓ Loaded SQuAD: {len(squad_train)} train, {len(squad_val)} validation")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 5: TRAINING CONFIGURATION AND LOOP (WITH CONTROLLED MIXING)
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 80)
+print("  TRAINING CONFIGURATION")
+print("=" * 80)
+
+@dataclass
+class TrainingConfig:
+    # Model architecture
+    vocab_size: int = 30522
+    dim: int = 256
+    n_layers: int = 4
+    n_heads: int = 4
+    max_seq_len: int = 384
+    dropout: float = 0.2
+
+    # HoloRAID
+    use_holoraid: bool = True
+    holoraid_prob: float = 0.05
+
+    # Training
+    batch_size: int = 16
+    epochs: int = 50
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.01
+    warmup_ratio: float = 0.1
+    max_grad_norm: float = 1.0
+
+    # Controlled mixing (protect SQuAD EM)
+    vocab_batch_ratio: float = 0.30  # 30% vocab, 70% SQuAD
+    steps_per_epoch: int = 800       # hard cap (keeps training predictable)
+
+    # Early stopping
+    patience: int = 5
+    min_delta: float = 0.001
+
+    # Logging
+    log_every: int = 50
+    save_best: bool = True
+
+config = TrainingConfig()
+
+if not torch.cuda.is_available():
+    config.batch_size = 4
+    config.dim = 128
+    config.n_layers = 2
+    config.epochs = 10
+    config.steps_per_epoch = 200
+    print("  ⚠️ CPU mode - reduced configuration")
+
+print(f"\n  Model Configuration:")
+print(f"    Dimension: {config.dim}")
+print(f"    Layers: {config.n_layers}")
+print(f"    Heads: {config.n_heads}")
+print(f"    Dropout: {config.dropout}")
+print(f"    HoloRAID: {config.use_holoraid} (prob={config.holoraid_prob})")
+
+print(f"\n  Training Configuration:")
+print(f"    Batch size: {config.batch_size}")
+print(f"    Epochs: {config.epochs}")
+print(f"    Learning rate: {config.learning_rate}")
+print(f"    Early stopping patience: {config.patience}")
+print(f"    Mix: {int((1-config.vocab_batch_ratio)*100)}% SQuAD / {int(config.vocab_batch_ratio*100)}% Vocab")
+print(f"    Steps/epoch cap: {config.steps_per_epoch}")
+
+print("\n  Initializing model...")
+model = HolographicGearboxModel(
+    vocab_size=config.vocab_size,
+    dim=config.dim,
+    n_layers=config.n_layers,
+    n_heads=config.n_heads,
+    max_seq_len=config.max_seq_len,
+    dropout=config.dropout,
+    frequencies=PRIME_FREQUENCIES["default"],
+    use_holoraid=config.use_holoraid,
+    holoraid_prob=config.holoraid_prob
+).to(DEVICE)
+
+n_params = model.get_num_parameters()
+print(f"  ✓ Model initialized: {n_params:,} parameters")
+
+def collate_fn(batch):
+    return {
+        "input_ids": torch.stack([x["input_ids"] for x in batch]),
+        "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
+        "start_positions": torch.tensor([x["start_positions"] for x in batch], dtype=torch.long),
+        "end_positions": torch.tensor([x["end_positions"] for x in batch], dtype=torch.long),
+    }
+
+# Two loaders, mixed in training loop
+squad_loader = DataLoader(
+    squad_train,
+    batch_size=config.batch_size,
+    shuffle=True,
+    collate_fn=collate_fn,
+    num_workers=0,
+    pin_memory=torch.cuda.is_available()
+)
+
+vocab_loader = DataLoader(
+    vocab_dataset,
+    batch_size=config.batch_size,
+    shuffle=True,
+    collate_fn=collate_fn,
+    num_workers=0,
+    pin_memory=torch.cuda.is_available()
+)
+
+val_loader = DataLoader(
+    squad_val,
+    batch_size=config.batch_size,
+    shuffle=False,
+    collate_fn=collate_fn,
+    num_workers=0,
+    pin_memory=torch.cuda.is_available()
+)
+
+print(f"  ✓ DataLoaders: {len(squad_loader)} SQuAD train batches, {len(vocab_loader)} Vocab batches, {len(val_loader)} val batches")
+
+# Optimizer with weight decay (excluding biases and LayerNorm)
+no_decay = ["bias", "LayerNorm.weight", "norm.weight"]
+optimizer_groups = [
+    {
+        "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+        "weight_decay": config.weight_decay
+    },
+    {
+        "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+        "weight_decay": 0.0
+    }
+]
+optimizer = AdamW(optimizer_groups, lr=config.learning_rate)
+
+# Scheduler
+total_steps = config.steps_per_epoch * config.epochs
+warmup_steps = int(total_steps * config.warmup_ratio)
+scheduler = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=warmup_steps,
+    num_training_steps=total_steps
+)
+
+print(f"  ✓ Optimizer: AdamW (lr={config.learning_rate}, wd={config.weight_decay})")
+print(f"  ✓ Scheduler: Linear warmup ({warmup_steps} steps) + decay")
+print(f"  ✓ Total steps: {total_steps} (capped)")
+
+LR_HISTORY = []
+
+def mixed_batch_stream(squad_loader, vocab_loader, vocab_ratio: float):
+    """
+    Infinite stream of batches mixed by probability.
+    """
+    squad_iter = itertools.cycle(squad_loader)
+    vocab_iter = itertools.cycle(vocab_loader)
+    while True:
+        if random.random() < vocab_ratio:
+            yield "vocab", next(vocab_iter)
+        else:
+            yield "squad", next(squad_iter)
+
+def train_epoch(model, squad_loader, vocab_loader, optimizer, scheduler, config, epoch: int):
+    model.train()
+    total_loss = 0.0
+    n = 0
+
+    stream = mixed_batch_stream(squad_loader, vocab_loader, config.vocab_batch_ratio)
+    pbar = tqdm(range(config.steps_per_epoch), desc=f"Epoch {epoch+1}/{config.epochs}")
+
+    for step in pbar:
+        source, batch = next(stream)
+
+        input_ids = batch["input_ids"].to(DEVICE)
+        attention_mask = batch["attention_mask"].to(DEVICE)
+        start_positions = batch["start_positions"].to(DEVICE)
+        end_positions = batch["end_positions"].to(DEVICE)
+
+        outputs = model(input_ids, attention_mask, task="qa")
+        start_loss = F.cross_entropy(outputs["start_logits"], start_positions)
+        end_loss = F.cross_entropy(outputs["end_logits"], end_positions)
+        loss = 0.5 * (start_loss + end_loss)
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+
+        lr = scheduler.get_last_lr()[0]
+        LR_HISTORY.append(lr)
+
+        total_loss += loss.item()
+        n += 1
+
+        if (step + 1) % config.log_every == 0:
+            pbar.set_postfix({
+                "src": source,
+                "loss": f"{loss.item():.4f}",
+                "avg": f"{total_loss/n:.4f}",
+                "lr": f"{lr:.2e}"
+            })
+        else:
+            pbar.set_postfix({"src": source, "avg": f"{total_loss/n:.4f}", "lr": f"{lr:.2e}"})
+
+    return total_loss / max(n, 1)
+
+def evaluate(model, loader):
+    model.eval()
+    total_loss = 0.0
+    correct_start = 0
+    correct_end = 0
+    exact_match = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Evaluating", leave=False):
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            start_positions = batch["start_positions"].to(DEVICE)
+            end_positions = batch["end_positions"].to(DEVICE)
+
+            outputs = model(input_ids, attention_mask, task="qa")
+
+            start_loss = F.cross_entropy(outputs["start_logits"], start_positions)
+            end_loss = F.cross_entropy(outputs["end_logits"], end_positions)
+            loss = 0.5 * (start_loss + end_loss)
+            total_loss += loss.item() * input_ids.size(0)
+
+            start_preds = outputs["start_logits"].argmax(dim=-1)
+            end_preds = outputs["end_logits"].argmax(dim=-1)
+
+            correct_start += (start_preds == start_positions).sum().item()
+            correct_end += (end_preds == end_positions).sum().item()
+            exact_match += ((start_preds == start_positions) & (end_preds == end_positions)).sum().item()
+            total += input_ids.size(0)
+
+    return {
+        "loss": total_loss / max(total, 1),
+        "start_acc": correct_start / max(total, 1),
+        "end_acc": correct_end / max(total, 1),
+        "exact_match": exact_match / max(total, 1),
+    }
+
+print("\n" + "=" * 80)
+print("  STARTING TRAINING (EARLY STOPPING)")
+print("=" * 80)
+
+train_losses = []
+val_metrics_history = []
+best_val_loss = float("inf")
+best_exact_match = 0.0
+patience_counter = 0
+best_epoch = 0
+
+for epoch in range(config.epochs):
+    train_loss = train_epoch(model, squad_loader, vocab_loader, optimizer, scheduler, config, epoch)
+    train_losses.append(train_loss)
+
+    val_metrics = evaluate(model, val_loader)
+    val_metrics_history.append(val_metrics)
+
+    print(f"\n  Epoch {epoch+1}/{config.epochs} Summary:")
+    print(f"    Train Loss:    {train_loss:.4f}")
+    print(f"    Val Loss:      {val_metrics['loss']:.4f}")
+    print(f"    Start Acc:     {val_metrics['start_acc']:.4f}")
+    print(f"    End Acc:       {val_metrics['end_acc']:.4f}")
+    print(f"    Exact Match:   {val_metrics['exact_match']:.4f}")
+
+    improved = False
+    if val_metrics["loss"] < best_val_loss - config.min_delta:
+        best_val_loss = val_metrics["loss"]
+        improved = True
+    if val_metrics["exact_match"] > best_exact_match:
+        best_exact_match = val_metrics["exact_match"]
+        improved = True
+
+    if improved:
+        best_epoch = epoch + 1
+        patience_counter = 0
+        if config.save_best:
+            torch.save({
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_loss": val_metrics["loss"],
+                "exact_match": val_metrics["exact_match"],
+                "config": config.__dict__,
+                "vocab_cache_path": VOCAB_CACHE_PATH,
+                "vocab_entries": len(vocab_data),
+                "vocab_samples": len(vocab_dataset),
+            }, "holographic_gearbox_best.pt")
+            print(f"    ✓ New best model saved! (loss={best_val_loss:.4f}, EM={best_exact_match:.4f})")
+    else:
+        patience_counter += 1
+        print(f"    No improvement ({patience_counter}/{config.patience})")
+
+    if patience_counter >= config.patience:
+        print(f"\n  Early stopping triggered at epoch {epoch+1}")
+        print(f"  Best epoch was {best_epoch} with val_loss={best_val_loss:.4f}, EM={best_exact_match:.4f}")
+        break
+
+print("\n✓ Training complete!")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# CELL 6: VISUALIZATION AND ANALYSIS
+# ════════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "=" * 80)
+print("  VISUALIZATION AND ANALYSIS")
+print("=" * 80)
+
+fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+
+epochs_range = range(1, len(train_losses) + 1)
+
+# 1. Loss curves
+ax1 = axes[0, 0]
+ax1.plot(epochs_range, train_losses, linewidth=2, label="Train Loss")
+ax1.plot(epochs_range, [m["loss"] for m in val_metrics_history], linewidth=2, label="Val Loss")
+ax1.axvline(best_epoch, linestyle="--", label=f"Best Epoch ({best_epoch})")
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Loss")
+ax1.set_title("Training and Validation Loss")
+ax1.legend()
+ax1.grid(True, alpha=0.3)
+
+# 2. Accuracy curves
+ax2 = axes[0, 1]
+ax2.plot(epochs_range, [m["start_acc"] for m in val_metrics_history], linewidth=2, label="Start Acc")
+ax2.plot(epochs_range, [m["end_acc"] for m in val_metrics_history], linewidth=2, label="End Acc")
+ax2.set_xlabel("Epoch")
+ax2.set_ylabel("Accuracy")
+ax2.set_title("Position Prediction Accuracy")
+ax2.legend()
+ax2.grid(True, alpha=0.3)
+
+# 3. Exact match
+ax3 = axes[0, 2]
+ax3.bar(list(epochs_range), [m["exact_match"] for m in val_metrics_history], alpha=0.7)
+ax3.axhline(best_exact_match, linestyle="--", label=f"Best ({best_exact_match:.4f})")
+ax3.set_xlabel("Epoch")
+ax3.set_ylabel("Exact Match")
+ax3.set_title("Exact Match Score")
+ax3.legend()
+ax3.grid(True, alpha=0.3)
+
+# 4. Learning rate schedule (sample per epoch)
+ax4 = axes[1, 0]
+if LR_HISTORY:
+    steps_per_epoch = config.steps_per_epoch
+    lr_epoch = [LR_HISTORY[min((i+1)*steps_per_epoch - 1, len(LR_HISTORY)-1)] for i in range(len(train_losses))]
+    ax4.plot(epochs_range, lr_epoch, linewidth=2)
+ax4.set_xlabel("Epoch")
+ax4.set_ylabel("Learning Rate")
+ax4.set_title("Learning Rate Schedule (per epoch)")
+ax4.grid(True, alpha=0.3)
+
+# 5. Holographic frequency amplitudes
+ax5 = axes[1, 1]
+last_attn = model.layers[-1].attention
+alphas = last_attn.alpha.detach().cpu().numpy()
+im = ax5.imshow(alphas, aspect="auto")
+ax5.set_xlabel("Frequency Index")
+ax5.set_ylabel("Head Index")
+ax5.set_title("Learned Amplitude Parameters (Last Layer)")
+ax5.set_xticks(range(len(PRIME_FREQUENCIES["default"])))
+ax5.set_xticklabels(PRIME_FREQUENCIES["default"])
+plt.colorbar(im, ax=ax5)
+
+# 6. Per-frequency importance
+ax6 = axes[1, 2]
+all_alphas = [layer.attention.alpha.detach().cpu().numpy() for layer in model.layers]
+avg_importance = np.mean([np.mean(np.abs(a), axis=0) for a in all_alphas], axis=0)
+ax6.bar(PRIME_FREQUENCIES["default"], avg_importance, alpha=0.7)
+ax6.set_xlabel("Prime Frequency")
+ax6.set_ylabel("Average |Amplitude|")
+ax6.set_title("Frequency Importance (Avg Across Layers)")
+ax6.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("holographic_gearbox_training.png", dpi=150, bbox_inches="tight")
+plt.savefig("holographic_gearbox_training.pdf", bbox_inches="tight")
+plt.show()
+print("  ✓ Saved training visualizations")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ATTENTION PATTERN VISUALIZATION
+# ───────────────────────────────────────────────────────────────────────────────
+
+def visualize_attention_patterns(model, tokenizer, question, context):
+    model.eval()
+    enc = tokenizer(
+        question, context,
+        max_length=128,
+        truncation="only_second",
+        padding="max_length",
+        return_tensors="pt"
+    )
+    input_ids = enc["input_ids"].to(DEVICE)
+    attention_mask = enc["attention_mask"].to(DEVICE)
+
+    with torch.no_grad():
+        outputs = model(input_ids, attention_mask, task="qa")
+
+    attn_weights = model.get_attention_weights(-1)
+    if attn_weights is None:
+        print("  No attention weights captured.")
+        return
+
+    weights = attn_weights[0].mean(dim=0).cpu().numpy()
+    tokens = tokenizer.convert_ids_to_tokens(input_ids[0])
+    valid_len = int(attention_mask[0].sum().item())
+    valid_len = min(valid_len, 40)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    im = axes[0].imshow(weights[:valid_len, :valid_len], aspect="auto")
+    axes[0].set_xlabel("Key Position")
+    axes[0].set_ylabel("Query Position")
+    axes[0].set_title("Holographic Attention Weights")
+    plt.colorbar(im, ax=axes[0])
+
+    start_probs = F.softmax(outputs["start_logits"][0], dim=-1).cpu().numpy()
+    end_probs = F.softmax(outputs["end_logits"][0], dim=-1).cpu().numpy()
+
+    axes[1].bar(range(valid_len), start_probs[:valid_len], alpha=0.5, label="Start")
+    axes[1].bar(range(valid_len), end_probs[:valid_len], alpha=0.5, label="End")
+    axes[1].set_xlabel("Token Position")
+    axes[1].set_ylabel("Probability")
+    axes[1].set_title("Answer Position Probabilities")
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig("holographic_attention_patterns.png", dpi=150, bbox_inches="tight")
+    plt.show()
+
+    start_idx = int(start_probs.argmax())
+    end_idx = int(end_probs.argmax())
+    print(f"\n  Question: {question}")
+    print(f"  Predicted answer span: [{start_idx}, {end_idx}]")
+    if end_idx >= start_idx and end_idx < valid_len:
+        answer_tokens = tokens[start_idx:end_idx+1]
+        answer = tokenizer.convert_tokens_to_string(answer_tokens)
+        print(f"  Predicted answer: {answer}")
+
+print("\n  Visualizing attention patterns...")
+sample_q = "What is machine learning?"
+sample_c = "Machine learning is a type of artificial intelligence that allows computers to learn from data without being explicitly programmed. It has revolutionized many fields including healthcare and finance."
+visualize_attention_patterns(model, tokenizer, sample_q, sample_c)
+print("  ✓ Saved attention visualization")
+
+# ───────────────────────────────────────────────────────────────────────────────
+# HOLORAID ANALYSIS
+# ───────────────────────────────────────────────────────────────────────────────
+
+def analyze_holoraid(model):
+    print("\n  HoloRAID Fault Tolerance Analysis:")
+    print("  " + "-" * 50)
+    raid = model.holoraid
+    print(f"    Shards (n): {raid.n}")
+    print(f"    Threshold (k): {raid.k}")
+    print(f"    Primes: {raid.primes}")
+    print(f"    Redundancy factor: {raid.get_redundancy_factor():.2f}x")
+    print(f"    Fault tolerance: {raid.get_fault_tolerance()} failures")
+
+    print("\n    Reconstruction test:")
+    test_tensor = torch.randn(4, 16, 64)
+
+    for n_failures in range(raid.n - raid.k + 1):
+        if n_failures == 0:
+            indices = list(range(raid.k))
+        else:
+            available = list(range(raid.n))
+            random.shuffle(available)
+            indices = sorted(available[:raid.k])
+
+        shards = raid.encode(test_tensor)
+        reconstructed = raid.decode(shards, indices)
+        error = (reconstructed - test_tensor).abs().mean().item()
+        print(f"      {n_failures} failures: reconstruction error = {error:.6f}")
+
+analyze_holoraid(model)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FINAL SUMMARY AND MODEL SAVING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print("\n" + "█" * 80)
+print("█  TRAINING COMPLETE - FINAL SUMMARY" + " " * 40 + "█")
+print("█" * 80)
+
+torch.save({
+    "model_state_dict": model.state_dict(),
+    "config": config.__dict__,
+    "train_losses": train_losses,
+    "val_metrics": val_metrics_history,
+    "best_epoch": best_epoch,
+    "best_val_loss": best_val_loss,
+    "best_exact_match": best_exact_match,
+    "frequencies": PRIME_FREQUENCIES["default"],
+    # keep the checkpoint light; vocab itself is in the JSONL cache file
+    "vocab_cache_path": VOCAB_CACHE_PATH,
+    "vocab_entries": len(vocab_data),
+    "vocab_samples": len(vocab_dataset),
+}, "holographic_gearbox_final.pt")
+
+summary = f"""
+  MODEL: HyperMorphic Holographic Gearbox
+  ═══════════════════════════════════════════════════════════════
+
+  ARCHITECTURE
+  ────────────
+  • Parameters:      {n_params:,}
+  • Dimension:       {config.dim}
+  • Layers:          {config.n_layers}
+  • Heads:           {config.n_heads}
+  • Frequencies:     {PRIME_FREQUENCIES['default']}
+  • HoloRAID:        {config.use_holoraid} (n=5, k=3)
+
+  TRAINING DATA
+  ─────────────
+  • Vocab entries:   {len(vocab_data)} (cached in {VOCAB_CACHE_PATH})
+  • Vocab QA samples:{len(vocab_dataset)}
+  • SQuAD Train:     {len(squad_train)}
+  • SQuAD Val:       {len(squad_val)}
+  • Mix ratio:       {int((1-config.vocab_batch_ratio)*100)}% SQuAD / {int(config.vocab_batch_ratio*100)}% Vocab
+
+  TRAINING
+  ────────
+  • Epochs run:      {len(train_losses)}/{config.epochs}
+  • Steps/epoch:     {config.steps_per_epoch}
+  • Best epoch:      {best_epoch}
+  • Learning rate:   {config.learning_rate}
+  • Early stopping:  patience={config.patience}
+
+  RESULTS
+  ───────
+  • Best Val Loss:    {best_val_loss:.4f}
+  • Best Exact Match: {best_exact_match:.4f}
+  • Final Train Loss: {train_losses[-1]:.4f}
+  • Final Val Loss:   {val_metrics_history[-1]['loss']:.4f}
+  • Final Start Acc:  {val_metrics_history[-1]['start_acc']:.4f}
+  • Final End Acc:    {val_metrics_history[-1]['end_acc']:.4f}
+
+  FILES SAVED
+  ───────────
+  • wordnet_vocab_cache.jsonl         - Offline dictionary+thesaurus cache
+  • holographic_gearbox_best.pt       - Best checkpoint
+  • holographic_gearbox_final.pt      - Final model + history
+  • holographic_gearbox_training.png  - Training curves
+  • holographic_gearbox_training.pdf  - Training curves (vector)
+  • holographic_attention_patterns.png- Attention visualization
+"""
+print(summary)
+
+print("█" * 80)
+print("█  🌊 HOLOGRAPHIC GEARBOX READY FOR GITHUB (OFFLINE VOCAB) 🌊" + " " * 16 + "█")
+    print("█" * 80)
