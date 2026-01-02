@@ -1,35 +1,28 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  HYPERMORPHIC HOLOGRAPHIC GEARBOX - COMPLETE EDITION (UPGRADED)              ║
+║  HYPERMORPHIC HOLOGRAPHIC GEARBOX - COMPLETE EDITION (UPGRADED + FIXED)      ║
 ║  OFFLINE Dictionary+Thesaurus (WordNet+wordfreq) + SQuAD                     ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  UPGRADES IN THIS EDITION                                                   ║
-║  1) HOLO-RAID FIX (TRAINABLE / DIFFERENTIABLE)                              ║
-║     - Replaces integer CRT residues (non-differentiable) with differentiable ║
-║       prime-frequency shard encoding + shard dropout + learnable recon.      ║
-║     - Keeps a separate CRT class for analysis-only (optional).               ║
+║  FIXES APPLIED (THIS VERSION)                                               ║
+║  1) CONTEXT-ONLY LOSS (CRITICAL)                                            ║
+║     - start/end loss is computed ONLY over context tokens (sequence_id==1)  ║
+║     - CLS token is ALSO allowed (index 0) to support truncation fallback    ║
 ║                                                                              ║
-║  2) ATTENTION FIX (SOFTMAX NORMALIZATION)                                    ║
-║     - Replaces sigmoid+row-norm with softmax over keys (standard, sharper).  ║
-║     - Still holographic: multi-prime sin/cos score synthesis + temperature.  ║
+║  2) REAL SQuAD EM/F1 (STRING-LEVEL)                                         ║
+║     - decode spans to text via offset_mapping + context_mask                ║
+║     - evaluate.load("squad") if available                                   ║
 ║                                                                              ║
-║  3) ROBUST QA SPAN MAPPING                                                   ║
-║     - Uses sequence_ids() and offset_mapping to avoid misaligned spans.      ║
-║                                                                              ║
-║  4) REAL SQuAD EM/F1 EVAL (STRING-LEVEL)                                     ║
-║     - Decodes predicted spans back to text and uses evaluate.load("squad").  ║
-║                                                                              ║
-║  5) CONTROLLED DATASET MIXING                                                ║
-║     - Probabilistic batch mixing: e.g., 70% SQuAD / 30% Vocab.               ║
+║  3) HOLO-RAID FIX (DIFFERENTIABLE) + ATTENTION FIX (SOFTMAX)                ║
+║     - as per your upgraded architecture                                     ║
 ║                                                                              ║
 ║  Author: Shaun Gerrard                                                       ║
 ║  License: MIT                                                                ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 GOOGLE COLAB:
-1) Paste into a single cell (or split into cells where "CELL" headers are)
-2) Run. It installs deps, builds offline vocab cache, trains with early stopping
+1) Paste into a single cell (or split by CELL headers)
+2) Run.
 """
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -37,7 +30,7 @@ GOOGLE COLAB:
 # ════════════════════════════════════════════════════════════════════════════════
 
 print("█" * 80)
-print("█  HYPERMORPHIC HOLOGRAPHIC GEARBOX - UPGRADED (HOLO-RAID+ATTN FIXES)" + " " * 2 + "█")
+print("█  HYPERMORPHIC HOLOGRAPHIC GEARBOX - FIXED (CTX-LOSS + REAL EM/F1)" + " " * 1 + "█")
 print("█" * 80)
 
 print("\n" + "=" * 80)
@@ -78,7 +71,6 @@ import os
 import re
 import json
 import math
-import time
 import random
 import itertools
 import warnings
@@ -102,7 +94,7 @@ import nltk
 from nltk.corpus import wordnet as wn
 from wordfreq import top_n_list
 
-# SQuAD metric
+# SQuAD metric (string-level)
 try:
     import evaluate
     SQUAD_METRIC = evaluate.load("squad")
@@ -121,7 +113,6 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
     torch.backends.cudnn.deterministic = True
 
-# Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"\n✓ Device: {DEVICE}")
 if torch.cuda.is_available():
@@ -147,19 +138,12 @@ print("\n" + "=" * 80)
 print("  BUILDING HYPERMORPHIC HOLOGRAPHIC GEARBOX ARCHITECTURE (UPGRADED)")
 print("=" * 80)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# HOLO-RAID (TRAINABLE / DIFFERENTIABLE) — FIX FOR GRADIENT FLOW
-# ───────────────────────────────────────────────────────────────────────────────
 class HoloRAIDDifferentiable(nn.Module):
     """
     Differentiable HoloRAID:
-      - Encode: prime-frequency holographic "shards" via sin/cos over x
-      - Corrupt: shard dropout (simulate failures) — still differentiable
+      - Encode: prime-frequency shards via sin/cos over x
+      - Corrupt: shard dropout (simulated failures)
       - Decode: learnable weighted reconstruction + residual
-    This behaves like fault-tolerant redundancy regularization inside the network.
-
-    NOTE: This is the *trainable* replacement for integer CRT residues (which
-    breaks gradients due to int casting and modulus).
     """
     def __init__(self,
                  dim: int,
@@ -175,124 +159,42 @@ class HoloRAIDDifferentiable(nn.Module):
         self.dropout_p = dropout_p
         self.strength = strength
 
-        # Learnable per-shard mixing (helps reconstruction be useful)
         self.shard_mix = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(self.n)])
         self.recon_mix = nn.Linear(dim, dim, bias=False)
-
-        # Learnable per-shard weights (soft "CRT coefficients" analogue)
         self.shard_w = nn.Parameter(torch.ones(self.n))
-
         self.norm = nn.LayerNorm(dim)
 
     def _make_shard(self, x: torch.Tensor, p: int, mix: nn.Module) -> torch.Tensor:
-        # x: [B,L,D]
-        # Use both sin & cos for richer invertible-ish code; keep same dim by mixing.
-        # Important: no floor/mod/ints.
         omega = (2.0 * math.pi) / float(p)
         s = torch.sin(omega * x)
         c = torch.cos(omega * x)
-        shard = mix(s + c)
-        return shard
+        return mix(s + c)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Build shards
-        shards = []
-        for i, p in enumerate(self.primes):
-            shards.append(self._make_shard(x, p, self.shard_mix[i]))
-        shards = torch.stack(shards, dim=0)  # [n,B,L,D]
+        shards = torch.stack([self._make_shard(x, p, self.shard_mix[i]) for i, p in enumerate(self.primes)], dim=0)
 
-        # Shard dropout mask (simulate failures)
         if self.training and self.dropout_p > 0:
-            # keep-prob
             keep = 1.0 - self.dropout_p
-            mask = (torch.rand(self.n, device=x.device) < keep).float()  # [n]
-            # ensure at least k survive
+            mask = (torch.rand(self.n, device=x.device) < keep).float()
             if mask.sum().item() < self.k:
-                # force top-k keep (random)
                 idx = torch.randperm(self.n, device=x.device)[:self.k]
                 mask = torch.zeros(self.n, device=x.device)
                 mask[idx] = 1.0
         else:
             mask = torch.ones(self.n, device=x.device)
 
-        # Weighted reconstruction
         w = F.softmax(self.shard_w, dim=0) * mask
-        denom = w.sum().clamp_min(1e-6)
-        w = w / denom
+        w = w / w.sum().clamp_min(1e-6)
 
-        recon = (w.view(self.n, 1, 1, 1) * shards).sum(dim=0)  # [B,L,D]
+        recon = (w.view(self.n, 1, 1, 1) * shards).sum(dim=0)
         recon = self.recon_mix(recon)
 
-        # Residual + norm
-        out = self.norm(x + self.strength * recon)
-        return out
+        return self.norm(x + self.strength * recon)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# OPTIONAL: CRT-STYLE HOLO-RAID (ANALYSIS ONLY) — NON-DIFFERENTIABLE
-# ───────────────────────────────────────────────────────────────────────────────
-class HoloRAIDCRT(nn.Module):
-    """
-    Non-differentiable CRT residues (analysis/testing only).
-    Keep this out of training graphs. Use with torch.no_grad().
-    """
-    def __init__(self, n_shards=5, k_threshold=3, primes=None, scale=100.0):
-        super().__init__()
-        self.n = n_shards
-        self.k = k_threshold
-        self.scale = scale
-        self.primes = (primes or PRIME_FREQUENCIES["holoraid"])[:n_shards]
-        self.register_buffer("prime_tensor", torch.tensor(self.primes, dtype=torch.float32))
-
-    def _mod_inverse(self, a: int, m: int) -> int:
-        def egcd(a, b):
-            if b == 0:
-                return a, 1, 0
-            g, x, y = egcd(b, a % b)
-            return g, y, x - (a // b) * y
-        g, x, _ = egcd(a % m, m)
-        if g != 1:
-            raise ValueError("No inverse")
-        return x % m
-
-    def _coeffs(self, indices):
-        ps = [self.primes[i] for i in indices]
-        M = 1
-        for p in ps:
-            M *= p
-        Mi = [M // p for p in ps]
-        yi = [self._mod_inverse(Mi[j], ps[j]) for j in range(len(ps))]
-        return M, Mi, yi
-
-    def encode(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x_shift = x - x.min() + 1
-        x_int = (x_shift * self.scale).long()
-        shards = [(x_int % p).float() / p for p in self.primes]
-        self._last_min = x.min().item()
-        return shards
-
-    def decode(self, shards: List[torch.Tensor], indices=None) -> torch.Tensor:
-        if indices is None:
-            indices = list(range(self.k))
-        indices = sorted(indices[:self.k])
-        M, Mi, yi = self._coeffs(indices)
-        out = torch.zeros_like(shards[0])
-        for j, idx in enumerate(indices):
-            p = self.primes[idx]
-            r = (shards[idx] * p).round()
-            out = out + r * Mi[j] * yi[j]
-        out = torch.fmod(out, float(M)) / self.scale
-        out = out + self._last_min - 1
-        return out
-
-
-# ───────────────────────────────────────────────────────────────────────────────
-# SAFEGEAR
-# ───────────────────────────────────────────────────────────────────────────────
 class SafeGear(nn.Module):
     def __init__(self, dim: int, n_gears: int = 3):
         super().__init__()
-        self.dim = dim
         self.n_gears = n_gears
         self.gear_a = nn.Parameter(torch.ones(n_gears) * 0.5)
         self.gear_b = nn.Parameter(torch.ones(n_gears) * 7.0)
@@ -314,14 +216,10 @@ class SafeGear(nn.Module):
         return self.norm(out + x)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# HOLOMIX
-# ───────────────────────────────────────────────────────────────────────────────
 class HoloMix(nn.Module):
     def __init__(self, dim: int, hidden_dim: int = None,
                  frequencies: List[int] = None, alpha: float = 0.30, dropout: float = 0.1):
         super().__init__()
-        self.dim = dim
         self.hidden_dim = hidden_dim or dim * 4
         self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
         self.n_freq = len(self.frequencies)
@@ -348,18 +246,13 @@ class HoloMix(nn.Module):
         return self.norm(out)
 
 
-# ───────────────────────────────────────────────────────────────────────────────
-# HOLOGRAPHIC ATTENTION (FIXED: SOFTMAX)
-# ───────────────────────────────────────────────────────────────────────────────
 class HolographicAttention(nn.Module):
     """
-    Fix: use softmax(scores) over keys, instead of sigmoid + row-normalize.
-    Upgrade: sin+cos holographic synthesis per prime frequency.
+    FIX: softmax(scores) over keys.
     """
     def __init__(self, dim: int, n_heads: int = 4, dropout: float = 0.1, frequencies: List[int] = None):
         super().__init__()
         assert dim % n_heads == 0, "dim must be divisible by n_heads"
-        self.dim = dim
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
@@ -370,29 +263,23 @@ class HolographicAttention(nn.Module):
         self.Wv = nn.Linear(dim, dim)
         self.Wo = nn.Linear(dim, dim)
 
-        # Separate sin/cos amplitudes for richer score synthesis
         self.alpha_sin = nn.Parameter(torch.randn(n_heads, self.n_freq) * 0.10)
         self.alpha_cos = nn.Parameter(torch.randn(n_heads, self.n_freq) * 0.10)
         self.phi = nn.Parameter(torch.rand(n_heads, self.n_freq) * 2 * math.pi)
-
         self.temperature = nn.Parameter(torch.ones(1))
 
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(dim)
-
         self.last_attention_weights = None
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, D = x.shape
-
-        Q = self.Wq(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)  # [B,H,L,hd]
+        Q = self.Wq(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         K = self.Wk(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
         V = self.Wv(x).view(B, L, self.n_heads, self.head_dim).transpose(1, 2)
 
-        sim = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)  # [B,H,L,L]
-
-        temp = self.temperature.abs() + 0.1
-        sim = sim / temp
+        sim = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        sim = sim / (self.temperature.abs() + 0.1)
 
         scores = torch.zeros_like(sim)
         for f_idx, p in enumerate(self.frequencies):
@@ -401,17 +288,15 @@ class HolographicAttention(nn.Module):
             scores = scores + self.alpha_cos[:, f_idx].view(1, self.n_heads, 1, 1) * torch.cos(phase)
 
         if mask is not None:
-            # mask expected shape [B,1,1,L] or [B,L]
             if mask.dim() == 2:
                 mask = mask.unsqueeze(1).unsqueeze(2)
             scores = scores.masked_fill(mask == 0, -1e9)
 
-        # FIX: softmax
         weights = torch.softmax(scores, dim=-1)
         self.last_attention_weights = weights.detach()
 
         weights = self.dropout(weights)
-        out = torch.matmul(weights, V)  # [B,H,L,hd]
+        out = torch.matmul(weights, V)
         out = out.transpose(1, 2).contiguous().view(B, L, D)
         out = self.Wo(out)
         return self.norm(out)
@@ -443,17 +328,16 @@ class HolographicGearboxModel(nn.Module):
                  max_seq_len: int = 384,
                  dropout: float = 0.2,
                  frequencies: List[int] = None,
-                 # HOLO-RAID (differentiable) controls
                  use_holoraid: bool = True,
                  holoraid_prob: float = 0.10,
                  holoraid_dropout_p: float = 0.25,
                  holoraid_strength: float = 0.35):
         super().__init__()
-        self.dim = dim
         self.max_seq_len = max_seq_len
         self.frequencies = frequencies or PRIME_FREQUENCIES["default"]
         self.use_holoraid = use_holoraid
         self.holoraid_prob = holoraid_prob
+        self.dim = dim
 
         self.token_embed = nn.Embedding(vocab_size, dim)
         self.safegear = SafeGear(dim, n_gears=3)
@@ -461,7 +345,6 @@ class HolographicGearboxModel(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, dim))
         self._init_positions()
 
-        # FIXED: differentiable HoloRAID (trainable)
         self.holoraid = HoloRAIDDifferentiable(
             dim=dim,
             primes=PRIME_FREQUENCIES["holoraid"],
@@ -478,21 +361,18 @@ class HolographicGearboxModel(nn.Module):
         self.drop = nn.Dropout(dropout)
 
         self.qa_head = nn.Linear(dim, 2)
-
         self._init_weights()
 
     def _init_positions(self):
         pos = torch.arange(self.max_seq_len).float()
         pe = torch.zeros(self.max_seq_len, self.dim)
 
-        # prime holographic
         for i, p in enumerate(self.frequencies):
             if 2*i < self.dim:
                 pe[:, 2*i] = torch.sin(2 * math.pi * pos / p)
             if 2*i+1 < self.dim:
                 pe[:, 2*i+1] = torch.cos(2 * math.pi * pos / p)
 
-        # remaining dims: standard sinusoid
         start = 2 * len(self.frequencies)
         for i in range(start, self.dim, 2):
             div = 10000 ** (i / self.dim)
@@ -520,7 +400,6 @@ class HolographicGearboxModel(nn.Module):
         x = self.safegear(x)
         x = x + self.pos_embed[:, :L, :]
 
-        # FIXED: apply differentiable HoloRAID only probabilistically
         if self.use_holoraid and self.training and (random.random() < self.holoraid_prob):
             x = self.holoraid(x)
 
@@ -531,12 +410,8 @@ class HolographicGearboxModel(nn.Module):
             x = layer(x, mask)
 
         x = self.norm(x)
-        logits = self.qa_head(x)  # [B,L,2]
-        return {
-            "start_logits": logits[:, :, 0],
-            "end_logits": logits[:, :, 1],
-            "hidden_states": x
-        }
+        logits = self.qa_head(x)
+        return {"start_logits": logits[:, :, 0], "end_logits": logits[:, :, 1], "hidden_states": x}
 
     def get_num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -549,10 +424,10 @@ class HolographicGearboxModel(nn.Module):
         return None
 
 
-print("✓ Model architecture defined (Upgraded HoloRAID + Softmax Attention).")
+print("✓ Model architecture defined.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# CELL 4: DATA (OFFLINE VOCAB + SQuAD) WITH ROBUST SPAN MAPPING
+# CELL 4: DATA (OFFLINE VOCAB + SQuAD) WITH CONTEXT MASK
 # ════════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 80)
@@ -593,7 +468,6 @@ def wordnet_entry(word: str, max_syn=12, max_ant=8, max_rel=12) -> Optional[Dict
                 if a not in antonyms:
                     antonyms.append(a)
 
-        # small sample hypernyms/hyponyms
         for h in s.hypernyms()[:3]:
             for lemma in h.lemmas()[:3]:
                 rw = lemma.name().replace("_", " ").lower()
@@ -668,7 +542,6 @@ def build_massive_vocab_dataset(
         entry = wordnet_entry(w)
         if entry:
             dataset.append(entry)
-
         if len(dataset) >= target_size:
             break
 
@@ -676,11 +549,28 @@ def build_massive_vocab_dataset(
     print(f"  ✓ Saved vocab cache: {len(dataset)} entries → {cache_path}")
     return dataset
 
+def build_context_mask(enc, attention_mask_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Returns [L] int mask where:
+      - 1 for context tokens (sequence_id == 1)
+      - ALSO 1 for CLS token (index 0) so truncation fallback works
+      - 0 elsewhere (question, SEP, padding)
+    """
+    # enc is a fast BatchEncoding for a *single* example
+    seq_ids = enc.sequence_ids(0)  # list length L
+    m = torch.zeros_like(attention_mask_tensor, dtype=torch.long)
+    for i, sid in enumerate(seq_ids):
+        if sid == 1:
+            m[i] = 1
+    m[0] = 1  # allow CLS always
+    m = m * attention_mask_tensor.long()  # never allow padding
+    return m
+
 def find_answer_token_span(enc, answer_start: int, answer_text: str) -> Tuple[int, int]:
     """
-    Robust span mapping:
-      - Only consider context tokens (sequence_id == 1)
-      - Returns CLS (0) if not found (e.g., truncation)
+    Robust mapping using offsets + sequence_ids:
+      - context only (sequence_id == 1)
+      - CLS if not found (often truncation)
     """
     answer_end = answer_start + len(answer_text)
     offsets = enc["offset_mapping"][0].tolist()
@@ -709,10 +599,8 @@ class VocabularyQADataset(Dataset):
     def __init__(self, vocab_data: List[Dict[str, Any]], tokenizer, max_length: int = 384,
                  max_syn_show: int = 5, max_ant_show: int = 3, max_rel_show: int = 5):
         self.features: List[Dict[str, Any]] = []
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
         samples = []
+
         for entry in vocab_data:
             word = entry.get("word", "")
             if not word:
@@ -755,10 +643,16 @@ class VocabularyQADataset(Dataset):
                 return_offsets_mapping=True,
                 return_tensors="pt",
             )
+            input_ids = enc["input_ids"].squeeze(0)
+            attn_mask = enc["attention_mask"].squeeze(0)
+            ctx_mask = build_context_mask(enc, attn_mask)
+
             sp, ep = find_answer_token_span(enc, ans_start, ans)
+
             self.features.append({
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attn_mask,
+                "context_mask": ctx_mask,
                 "start_positions": sp,
                 "end_positions": ep,
             })
@@ -768,12 +662,7 @@ class VocabularyQADataset(Dataset):
 
     def __getitem__(self, i):
         f = self.features[i]
-        return {
-            "input_ids": f["input_ids"],
-            "attention_mask": f["attention_mask"],
-            "start_positions": f["start_positions"],
-            "end_positions": f["end_positions"],
-        }
+        return f
 
 class SQuADTrainDataset(Dataset):
     def __init__(self, tokenizer, split="train", max_length=384, max_samples=None):
@@ -782,8 +671,6 @@ class SQuADTrainDataset(Dataset):
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
         self.features: List[Dict[str, Any]] = []
-        self.tokenizer = tokenizer
-        self.max_length = max_length
 
         for ex in tqdm(dataset, desc=f"Tokenizing SQuAD ({split})"):
             enc = tokenizer(
@@ -794,6 +681,10 @@ class SQuADTrainDataset(Dataset):
                 return_offsets_mapping=True,
                 return_tensors="pt",
             )
+
+            input_ids = enc["input_ids"].squeeze(0)
+            attn_mask = enc["attention_mask"].squeeze(0)
+            ctx_mask = build_context_mask(enc, attn_mask)
 
             cls = 0
             sp, ep = cls, cls
@@ -803,8 +694,9 @@ class SQuADTrainDataset(Dataset):
                 sp, ep = find_answer_token_span(enc, astart, atext)
 
             self.features.append({
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attn_mask,
+                "context_mask": ctx_mask,
                 "start_positions": sp,
                 "end_positions": ep,
             })
@@ -813,17 +705,11 @@ class SQuADTrainDataset(Dataset):
         return len(self.features)
 
     def __getitem__(self, i):
-        f = self.features[i]
-        return {
-            "input_ids": f["input_ids"],
-            "attention_mask": f["attention_mask"],
-            "start_positions": f["start_positions"],
-            "end_positions": f["end_positions"],
-        }
+        return self.features[i]
 
 class SQuADValDataset(Dataset):
     """
-    Validation dataset retains context + offset_mapping for string-level EM/F1.
+    Validation retains offset_mapping + raw context/id/answers for string EM/F1.
     """
     def __init__(self, tokenizer, split="validation", max_length=384, max_samples=None):
         dataset = load_dataset("squad", split=split)
@@ -831,8 +717,6 @@ class SQuADValDataset(Dataset):
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
         self.items: List[Dict[str, Any]] = []
-        self.tokenizer = tokenizer
-        self.max_length = max_length
 
         for ex in tqdm(dataset, desc=f"Tokenizing SQuAD ({split})"):
             enc = tokenizer(
@@ -843,6 +727,10 @@ class SQuADValDataset(Dataset):
                 return_offsets_mapping=True,
                 return_tensors="pt",
             )
+
+            input_ids = enc["input_ids"].squeeze(0)
+            attn_mask = enc["attention_mask"].squeeze(0)
+            ctx_mask = build_context_mask(enc, attn_mask)
 
             cls = 0
             sp, ep = cls, cls
@@ -852,15 +740,15 @@ class SQuADValDataset(Dataset):
                 sp, ep = find_answer_token_span(enc, astart, atext)
 
             self.items.append({
-                "input_ids": enc["input_ids"].squeeze(0),
-                "attention_mask": enc["attention_mask"].squeeze(0),
+                "input_ids": input_ids,
+                "attention_mask": attn_mask,
+                "context_mask": ctx_mask,
                 "start_positions": sp,
                 "end_positions": ep,
                 "offset_mapping": enc["offset_mapping"].squeeze(0),  # [L,2]
                 "context": ex["context"],
                 "id": ex["id"],
-                "answers": ex["answers"],  # {"text":[...], "answer_start":[...]}
-                # We also need seq_ids for decoding; recompute from tokenizer fast path:
+                "answers": ex["answers"],
                 "question": ex["question"],
             })
 
@@ -868,18 +756,7 @@ class SQuADValDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, i):
-        x = self.items[i]
-        return {
-            "input_ids": x["input_ids"],
-            "attention_mask": x["attention_mask"],
-            "start_positions": x["start_positions"],
-            "end_positions": x["end_positions"],
-            "offset_mapping": x["offset_mapping"],
-            "context": x["context"],
-            "id": x["id"],
-            "answers": x["answers"],
-            "question": x["question"],
-        }
+        return self.items[i]
 
 print("\n  Initializing tokenizer...")
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased", use_fast=True)
@@ -908,7 +785,7 @@ squad_val   = SQuADValDataset(tokenizer, "validation", max_length=384, max_sampl
 print(f"  ✓ Loaded SQuAD: {len(squad_train)} train, {len(squad_val)} validation")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# CELL 5: TRAINING (CONTROLLED MIXING + EARLY STOPPING + REAL EM/F1)
+# CELL 5: TRAINING (CONTROLLED MIXING + EARLY STOPPING + REAL EM/F1 + CTX LOSS)
 # ════════════════════════════════════════════════════════════════════════════════
 
 print("\n" + "=" * 80)
@@ -917,7 +794,6 @@ print("=" * 80)
 
 @dataclass
 class TrainingConfig:
-    # Model
     vocab_size: int = 30522
     dim: int = 256
     n_layers: int = 4
@@ -925,13 +801,11 @@ class TrainingConfig:
     max_seq_len: int = 384
     dropout: float = 0.2
 
-    # HoloRAID (differentiable)
     use_holoraid: bool = True
     holoraid_prob: float = 0.10
     holoraid_dropout_p: float = 0.25
     holoraid_strength: float = 0.35
 
-    # Train
     batch_size: int = 16
     epochs: int = 50
     learning_rate: float = 1e-4
@@ -939,14 +813,11 @@ class TrainingConfig:
     warmup_ratio: float = 0.10
     max_grad_norm: float = 1.0
 
-    # Mixing
-    vocab_batch_ratio: float = 0.30     # 30% vocab, 70% SQuAD
+    vocab_batch_ratio: float = 0.30
     steps_per_epoch: int = 800
 
-    # Eval speed control
-    eval_max_examples: int = 600        # EM/F1 computed on subset for speed
+    eval_max_examples: int = 600  # decode subset for EM/F1 speed
 
-    # Early stopping
     patience: int = 5
     min_delta: float = 0.001
 
@@ -988,15 +859,16 @@ def collate_train(batch):
     return {
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        "context_mask": torch.stack([b["context_mask"] for b in batch]),
         "start_positions": torch.tensor([b["start_positions"] for b in batch], dtype=torch.long),
         "end_positions": torch.tensor([b["end_positions"] for b in batch], dtype=torch.long),
     }
 
 def collate_val(batch):
-    # keep python objects for decoding
     return {
         "input_ids": torch.stack([b["input_ids"] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"] for b in batch]),
+        "context_mask": torch.stack([b["context_mask"] for b in batch]),
         "start_positions": torch.tensor([b["start_positions"] for b in batch], dtype=torch.long),
         "end_positions": torch.tensor([b["end_positions"] for b in batch], dtype=torch.long),
         "offset_mapping": [b["offset_mapping"] for b in batch],
@@ -1010,15 +882,10 @@ squad_loader = DataLoader(squad_train, batch_size=config.batch_size, shuffle=Tru
 vocab_loader = DataLoader(vocab_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=collate_train, num_workers=0)
 val_loader   = DataLoader(squad_val,   batch_size=config.batch_size, shuffle=False, collate_fn=collate_val,   num_workers=0)
 
-# Optimizer
 no_decay = ["bias", "LayerNorm.weight", "norm.weight"]
-params_decay = []
-params_nodecay = []
+params_decay, params_nodecay = [], []
 for n, p in model.named_parameters():
-    if any(nd in n for nd in no_decay):
-        params_nodecay.append(p)
-    else:
-        params_decay.append(p)
+    (params_nodecay if any(nd in n for nd in no_decay) else params_decay).append(p)
 
 optimizer = torch.optim.AdamW(
     [{"params": params_decay, "weight_decay": config.weight_decay},
@@ -1041,6 +908,18 @@ def mixed_batch_stream(squad_loader, vocab_loader, vocab_ratio: float):
         else:
             yield "squad", next(squad_iter)
 
+def apply_context_mask_to_logits(start_logits: torch.Tensor,
+                                 end_logits: torch.Tensor,
+                                 context_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    start_logits/end_logits: [B,L]
+    context_mask: [B,L] (1 allowed, 0 masked)
+    """
+    neg = torch.tensor(-1e9, device=start_logits.device, dtype=start_logits.dtype)
+    start_m = start_logits.masked_fill(context_mask == 0, neg)
+    end_m   = end_logits.masked_fill(context_mask == 0, neg)
+    return start_m, end_m
+
 def train_epoch(epoch: int) -> float:
     model.train()
     total_loss = 0.0
@@ -1051,12 +930,16 @@ def train_epoch(epoch: int) -> float:
     for step in pbar:
         src, batch = next(stream)
         input_ids = batch["input_ids"].to(DEVICE)
-        attn = batch["attention_mask"].to(DEVICE)
-        sp = batch["start_positions"].to(DEVICE)
-        ep = batch["end_positions"].to(DEVICE)
+        attn      = batch["attention_mask"].to(DEVICE)
+        ctx_mask  = batch["context_mask"].to(DEVICE)
+        sp        = batch["start_positions"].to(DEVICE)
+        ep        = batch["end_positions"].to(DEVICE)
 
         out = model(input_ids, attn)
-        loss = 0.5 * (F.cross_entropy(out["start_logits"], sp) + F.cross_entropy(out["end_logits"], ep))
+
+        # ★ FIX: context-only masking for loss
+        s_logits, e_logits = apply_context_mask_to_logits(out["start_logits"], out["end_logits"], ctx_mask)
+        loss = 0.5 * (F.cross_entropy(s_logits, sp) + F.cross_entropy(e_logits, ep))
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -1079,76 +962,60 @@ def train_epoch(epoch: int) -> float:
 
 def best_span_from_logits(start_logits: np.ndarray,
                           end_logits: np.ndarray,
-                          ctx_token_indices: List[int],
+                          allowed_indices: np.ndarray,
                           max_answer_len: int = 30,
                           n_best: int = 20) -> Tuple[int, int]:
     """
-    Choose best (start,end) restricted to context tokens using logits.
+    Choose best (start,end) restricted to allowed indices (context + CLS).
     """
-    # take top candidates among context tokens
-    s_idx_sorted = sorted(ctx_token_indices, key=lambda i: start_logits[i], reverse=True)[:n_best]
-    e_idx_sorted = sorted(ctx_token_indices, key=lambda i: end_logits[i], reverse=True)[:n_best]
+    # top-n from allowed
+    s_candidates = allowed_indices[np.argsort(start_logits[allowed_indices])[::-1][:n_best]]
+    e_candidates = allowed_indices[np.argsort(end_logits[allowed_indices])[::-1][:n_best]]
 
     best_score = -1e18
-    best_s, best_e = ctx_token_indices[0], ctx_token_indices[0]
+    best_s, best_e = int(allowed_indices[0]), int(allowed_indices[0])
 
-    for s in s_idx_sorted:
-        for e in e_idx_sorted:
+    for s in s_candidates:
+        for e in e_candidates:
             if e < s:
                 continue
             if (e - s + 1) > max_answer_len:
                 continue
-            score = start_logits[s] + end_logits[e]
+            score = float(start_logits[s] + end_logits[e])
             if score > best_score:
                 best_score = score
-                best_s, best_e = s, e
+                best_s, best_e = int(s), int(e)
 
     return best_s, best_e
 
 def decode_batch_predictions(batch, start_logits_t, end_logits_t) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
     """
-    Decode predicted spans to text (for squad EM/F1).
-    Returns:
-      predictions: [{"id": ..., "prediction_text": ...}, ...]
-      references:  [{"id": ..., "answers": {...}}, ...]
+    Decode predicted spans to text using stored offset_mapping + context_mask.
     """
-    preds = []
-    refs = []
+    preds, refs = [], []
 
-    # We need sequence_ids for each item; compute using tokenizer on the fly (val set is small).
-    # This ensures correctness even if tokenizer behavior differs.
     for i in range(len(batch["id"])):
-        q = batch["question"][i]
         ctx = batch["context"][i]
-        off = batch["offset_mapping"][i].cpu().numpy().tolist()  # [L,2]
-        # recompute seq_ids
-        enc = tokenizer(
-            q, ctx,
-            max_length=config.max_seq_len,
-            truncation="only_second",
-            padding="max_length",
-            return_offsets_mapping=False,
-            return_tensors="pt"
-        )
-        seq_ids = tokenizer(q, ctx, max_length=config.max_seq_len, truncation="only_second",
-                            padding="max_length").sequence_ids()
-
-        start_logits = start_logits_t[i].detach().cpu().numpy()
-        end_logits   = end_logits_t[i].detach().cpu().numpy()
-
-        # context token indices
-        ctx_tok = [t for t, sid in enumerate(seq_ids) if sid == 1]
-
-        if len(ctx_tok) == 0:
+        off = batch["offset_mapping"][i].cpu().numpy()  # [L,2]
+        cm  = batch["context_mask"][i].cpu().numpy().astype(np.int32)  # [L]
+        allowed = np.where(cm == 1)[0]
+        if allowed.size == 0:
             pred_text = ""
         else:
-            s, e = best_span_from_logits(start_logits, end_logits, ctx_tok)
-            s_char, _ = off[s]
-            _, e_char = off[e]
-            if s_char == 0 and e_char == 0:
+            s_logits = start_logits_t[i].detach().cpu().numpy()
+            e_logits = end_logits_t[i].detach().cpu().numpy()
+            s, e = best_span_from_logits(s_logits, e_logits, allowed)
+
+            # If CLS chosen, treat as empty (mostly only hits when truncated label is CLS)
+            if s == 0 and e == 0:
                 pred_text = ""
             else:
-                pred_text = ctx[s_char:e_char].strip()
+                s_char, _ = off[s]
+                _, e_char = off[e]
+                if (s_char == 0 and e_char == 0) or (e_char < s_char):
+                    pred_text = ""
+                else:
+                    pred_text = ctx[s_char:e_char].strip()
 
         preds.append({"id": batch["id"][i], "prediction_text": pred_text})
         refs.append({"id": batch["id"][i], "answers": batch["answers"][i]})
@@ -1163,37 +1030,40 @@ def evaluate_model() -> Dict[str, float]:
     start_acc = 0
     end_acc = 0
 
-    all_preds = []
-    all_refs = []
+    all_preds, all_refs = [], []
+    decoded = 0
 
     with torch.no_grad():
-        seen = 0
         for batch in tqdm(val_loader, desc="Evaluating", leave=False):
             input_ids = batch["input_ids"].to(DEVICE)
             attn      = batch["attention_mask"].to(DEVICE)
+            ctx_mask  = batch["context_mask"].to(DEVICE)
             sp        = batch["start_positions"].to(DEVICE)
             ep        = batch["end_positions"].to(DEVICE)
 
             out = model(input_ids, attn)
-            loss = 0.5 * (F.cross_entropy(out["start_logits"], sp) + F.cross_entropy(out["end_logits"], ep))
-            bs = input_ids.size(0)
 
+            # ★ FIX: context-only masking for loss + predictions
+            s_logits, e_logits = apply_context_mask_to_logits(out["start_logits"], out["end_logits"], ctx_mask)
+            loss = 0.5 * (F.cross_entropy(s_logits, sp) + F.cross_entropy(e_logits, ep))
+
+            bs = input_ids.size(0)
             total_loss += loss.item() * bs
             total += bs
 
-            s_pred = out["start_logits"].argmax(dim=-1)
-            e_pred = out["end_logits"].argmax(dim=-1)
+            s_pred = s_logits.argmax(dim=-1)
+            e_pred = e_logits.argmax(dim=-1)
 
             start_acc += (s_pred == sp).sum().item()
             end_acc   += (e_pred == ep).sum().item()
             tok_em    += ((s_pred == sp) & (e_pred == ep)).sum().item()
 
-            # Real EM/F1 decode subset
-            if SQUAD_METRIC is not None and seen < config.eval_max_examples:
-                preds, refs = decode_batch_predictions(batch, out["start_logits"], out["end_logits"])
+            if SQUAD_METRIC is not None and decoded < config.eval_max_examples:
+                # decode with stored python-side batch fields
+                preds, refs = decode_batch_predictions(batch, s_logits, e_logits)
                 all_preds.extend(preds)
                 all_refs.extend(refs)
-                seen += bs
+                decoded += bs
 
     metrics = {
         "loss": total_loss / max(total, 1),
@@ -1213,8 +1083,7 @@ print("\n" + "=" * 80)
 print("  STARTING TRAINING (EARLY STOPPING)")
 print("=" * 80)
 
-train_losses = []
-val_hist = []
+train_losses, val_hist = [], []
 best_val = float("inf")
 best_em = -1.0
 best_epoch = 0
@@ -1242,7 +1111,6 @@ for epoch in range(config.epochs):
         best_val = vm["loss"]
         improved = True
 
-    # prefer real squad_em if available
     cur_em = vm.get("squad_em", vm["exact_match_tok"])
     if cur_em > best_em:
         best_em = cur_em
@@ -1290,7 +1158,6 @@ squad_f1_curve = [m.get("squad_f1", None) for m in val_hist]
 
 fig, axes = plt.subplots(2, 2, figsize=(14, 9))
 
-# Loss
 axes[0,0].plot(list(epochs_range), train_losses, linewidth=2, label="Train Loss")
 axes[0,0].plot(list(epochs_range), val_loss_curve, linewidth=2, label="Val Loss")
 axes[0,0].axvline(best_epoch, linestyle="--", label=f"Best ({best_epoch})")
@@ -1300,7 +1167,6 @@ axes[0,0].set_ylabel("Loss")
 axes[0,0].grid(True, alpha=0.3)
 axes[0,0].legend()
 
-# Token Acc
 axes[0,1].plot(list(epochs_range), [m["start_acc_tok"] for m in val_hist], linewidth=2, label="Start Acc (tok)")
 axes[0,1].plot(list(epochs_range), [m["end_acc_tok"] for m in val_hist], linewidth=2, label="End Acc (tok)")
 axes[0,1].set_title("Token Accuracy")
@@ -1309,7 +1175,6 @@ axes[0,1].set_ylabel("Accuracy")
 axes[0,1].grid(True, alpha=0.3)
 axes[0,1].legend()
 
-# EM/F1
 axes[1,0].plot(list(epochs_range), tok_em_curve, linewidth=2, label="Token EM (idx)")
 if any(v is not None for v in squad_em_curve):
     axes[1,0].plot(list(epochs_range), [v if v is not None else np.nan for v in squad_em_curve], linewidth=2, label="SQuAD EM (text)")
@@ -1320,7 +1185,6 @@ axes[1,0].set_xlabel("Epoch")
 axes[1,0].grid(True, alpha=0.3)
 axes[1,0].legend()
 
-# LR (per epoch)
 axes[1,1].set_title("Learning Rate (per epoch)")
 if LR_HISTORY:
     spe = config.steps_per_epoch
@@ -1337,12 +1201,13 @@ plt.show()
 
 print("  ✓ Saved: holographic_gearbox_training.png / .pdf")
 
-# Quick attention visualization sample
 def visualize_attention_sample(question: str, context: str, max_len: int = 128):
     model.eval()
-    enc = tokenizer(question, context, max_length=max_len, truncation="only_second", padding="max_length", return_tensors="pt")
+    enc = tokenizer(question, context, max_length=max_len, truncation="only_second", padding="max_length",
+                    return_offsets_mapping=True, return_tensors="pt")
     input_ids = enc["input_ids"].to(DEVICE)
     attn = enc["attention_mask"].to(DEVICE)
+    ctx_mask = build_context_mask(enc, enc["attention_mask"].squeeze(0)).unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
         out = model(input_ids, attn)
@@ -1352,8 +1217,7 @@ def visualize_attention_sample(question: str, context: str, max_len: int = 128):
         print("No attention captured.")
         return
 
-    # average heads
-    w2 = w[0].mean(dim=0).detach().cpu().numpy()  # [L,L]
+    w2 = w[0].mean(dim=0).detach().cpu().numpy()
     valid = int(attn[0].sum().item())
     valid = min(valid, 40)
 
@@ -1367,17 +1231,20 @@ def visualize_attention_sample(question: str, context: str, max_len: int = 128):
     plt.savefig("holographic_attention_patterns.png", dpi=150, bbox_inches="tight")
     plt.show()
 
-    # decoded answer
-    start_probs = F.softmax(out["start_logits"][0], dim=-1).detach().cpu().numpy()
-    end_probs   = F.softmax(out["end_logits"][0], dim=-1).detach().cpu().numpy()
-    s = int(start_probs.argmax())
-    e = int(end_probs.argmax())
-    toks = tokenizer.convert_ids_to_tokens(input_ids[0].detach().cpu().tolist())
+    # decode using masked logits (context-only)
+    s_logits, e_logits = apply_context_mask_to_logits(out["start_logits"], out["end_logits"], ctx_mask)
+    s = int(s_logits[0].argmax().item())
+    e = int(e_logits[0].argmax().item())
     if e < s:
         e = s
+    offsets = enc["offset_mapping"][0].cpu().numpy()
+    s_char, _ = offsets[s]
+    _, e_char = offsets[e]
+    pred = "" if (s == 0 and e == 0) else context[s_char:e_char].strip()
+
     print("\nQ:", question)
     print("Pred span:", (s,e))
-    print("Pred tokens:", tokenizer.convert_tokens_to_string(toks[s:e+1]))
+    print("Pred text:", pred)
 
 print("\n  Visualizing attention sample...")
 visualize_attention_sample(
@@ -1385,7 +1252,6 @@ visualize_attention_sample(
     "Machine learning is a type of artificial intelligence that allows computers to learn from data without being explicitly programmed."
 )
 
-# Save final
 torch.save({
     "model_state_dict": model.state_dict(),
     "config": config.__dict__,
